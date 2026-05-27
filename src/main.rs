@@ -1,15 +1,17 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use clap::{Parser, Subcommand, ValueEnum};
 use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, ClientBuilder};
+use reqwest::Url;
 use serde_json::{json, Value};
 use sha1::Sha1;
 use uuid::Uuid;
@@ -109,6 +111,14 @@ enum EdgeScriptCommand {
         #[arg(long)]
         domain: String,
     },
+    TestStaging {
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value = "staging.myalicdn.com")]
+        staging_domain: String,
+        #[arg(long, default_value_t = 15)]
+        timeout_seconds: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,12 +208,11 @@ impl Credentials {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let credentials = Credentials::from_env()?;
-    let client = CdnClient::new(credentials);
 
     match cli.command {
         Commands::Cdn { command } => match command {
             CdnCommand::Refresh { urls, refresh_type } => {
+                let client = cdn_client_from_env()?;
                 let urls = parse_refresh_urls(&urls, &refresh_type)?;
                 let response = client.refresh_object_caches(&urls, &refresh_type)?;
                 print_json(&response)?;
@@ -214,6 +223,7 @@ fn main() -> Result<()> {
                 domain,
                 environment,
             } => {
+                let client = cdn_client_from_env()?;
                 let response = client.query_edgescript(&domain, &environment)?;
                 print_json(&response)?;
             }
@@ -225,6 +235,7 @@ fn main() -> Result<()> {
                 pos,
                 enable,
             } => {
+                let client = cdn_client_from_env()?;
                 let rule = fs::read_to_string(&rule_file)
                     .with_context(|| format!("failed to read rule file {rule_file}"))?;
                 let response =
@@ -232,17 +243,34 @@ fn main() -> Result<()> {
                 print_json(&response)?;
             }
             EdgeScriptCommand::PublishStaging { domain } => {
+                let client = cdn_client_from_env()?;
                 let response = client.publish_edgescript_staging(&domain)?;
                 print_json(&response)?;
             }
             EdgeScriptCommand::RollbackStaging { domain } => {
+                let client = cdn_client_from_env()?;
                 let response = client.rollback_edgescript_staging(&domain)?;
                 print_json(&response)?;
+            }
+            EdgeScriptCommand::TestStaging {
+                url,
+                staging_domain,
+                timeout_seconds,
+            } => {
+                test_edgescript_staging_url(
+                    &url,
+                    &staging_domain,
+                    Duration::from_secs(timeout_seconds),
+                )?;
             }
         },
     }
 
     Ok(())
+}
+
+fn cdn_client_from_env() -> Result<CdnClient> {
+    Ok(CdnClient::new(Credentials::from_env()?))
 }
 
 #[derive(Debug)]
@@ -389,6 +417,81 @@ fn parse_refresh_urls(urls: &str, refresh_type: &RefreshType) -> Result<Vec<Stri
     }
 
     Ok(parsed)
+}
+
+fn resolve_staging_addrs(staging_domain: &str) -> Result<Vec<SocketAddr>> {
+    let addrs = (staging_domain, 443)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve {staging_domain}"))?
+        .collect::<Vec<_>>();
+
+    if addrs.is_empty() {
+        return Err(anyhow!("{staging_domain} did not resolve to any addresses"));
+    }
+
+    Ok(addrs)
+}
+
+fn test_edgescript_staging_url(url: &str, staging_domain: &str, timeout: Duration) -> Result<()> {
+    let url = Url::parse(url).with_context(|| format!("invalid staging test URL: {url}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("staging test URL must include a host"))?;
+    if url.scheme() != "https" {
+        return Err(anyhow!("staging test URL must use https"));
+    }
+
+    let addrs = resolve_staging_addrs(staging_domain)?;
+
+    println!(
+        "Resolved {staging_domain} to {}",
+        addrs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let addr = test_edgescript_staging_host(url.as_str(), host, &addrs, timeout)?;
+    println!("OK {} via {addr}", url.as_str());
+    Ok(())
+}
+
+fn test_edgescript_staging_host(
+    url: &str,
+    host: &str,
+    addrs: &[SocketAddr],
+    timeout: Duration,
+) -> Result<SocketAddr> {
+    let mut errors = Vec::new();
+
+    for addr in addrs {
+        let response = staging_test_client(host, *addr, timeout)
+            .get(url)
+            .header("user-agent", "aliyun-tools/edgescript-staging-test")
+            .send();
+
+        match response {
+            Ok(response)
+                if response.status().is_success() || response.status().is_redirection() =>
+            {
+                return Ok(*addr);
+            }
+            Ok(response) => errors.push(format!("{addr} returned {}", response.status())),
+            Err(err) => errors.push(format!("{addr} failed: {err}")),
+        }
+    }
+
+    Err(anyhow!("{}", errors.join("; ")))
+}
+
+fn staging_test_client(host: &str, addr: SocketAddr, timeout: Duration) -> Client {
+    ClientBuilder::new()
+        .resolve(host, addr)
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("staging test client configuration is valid")
 }
 
 fn sign_params(
@@ -595,5 +698,37 @@ mod tests {
 
         assert!(functions.to_string().contains("edge_function"));
         assert!(functions.to_string().contains("static_site_rewrite"));
+    }
+
+    #[test]
+    fn parses_single_staging_test_url_cli() {
+        let cli = Cli::try_parse_from([
+            "aliyun-tools",
+            "edgescript",
+            "test-staging",
+            "--url",
+            "https://admin2.aiyou178.com/",
+        ])
+        .unwrap();
+
+        let Commands::Edgescript { command } = cli.command else {
+            panic!("expected edgescript command");
+        };
+        let EdgeScriptCommand::TestStaging { url, .. } = command else {
+            panic!("expected test-staging command");
+        };
+        assert_eq!(url, "https://admin2.aiyou178.com/");
+    }
+
+    #[test]
+    fn rejects_non_https_staging_test_url() {
+        let err = test_edgescript_staging_url(
+            "http://admin2.aiyou178.com/",
+            "staging.invalid",
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("must use https"));
     }
 }

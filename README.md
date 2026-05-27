@@ -31,4 +31,5 @@ aliyun-tools edgescript push-staging \
   --pos head
 aliyun-tools edgescript publish-staging --domain "$CDN_EDGE_DOMAIN"
 aliyun-tools edgescript rollback-staging --domain "$CDN_EDGE_DOMAIN"
+aliyun-tools edgescript test-staging --url "https://admin2.aiyou178.com/"
 ```
