@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -110,10 +111,24 @@ enum EdgeScriptCommand {
     },
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RefreshType {
     File,
     Directory,
+}
+
+impl FromStr for RefreshType {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "file" => Ok(Self::File),
+            "directory" => Ok(Self::Directory),
+            _ => Err(format!(
+                "invalid refresh type {value}; expected File or Directory"
+            )),
+        }
+    }
 }
 
 impl RefreshType {
@@ -245,15 +260,7 @@ impl CdnClient {
     }
 
     fn refresh_object_caches(&self, urls: &[String], refresh_type: &RefreshType) -> Result<Value> {
-        let mut params = BTreeMap::new();
-        params.insert("Action".to_string(), "RefreshObjectCaches".to_string());
-        params.insert("ObjectPath".to_string(), urls.join("\n"));
-        params.insert(
-            "ObjectType".to_string(),
-            refresh_type.as_api_value().to_string(),
-        );
-
-        self.call(params)
+        self.call(refresh_object_caches_params(urls, refresh_type))
     }
 
     fn query_edgescript(&self, domain: &str, environment: &EdgeScriptEnv) -> Result<Value> {
@@ -345,6 +352,20 @@ impl CdnClient {
 
         Ok(parsed)
     }
+}
+
+fn refresh_object_caches_params(
+    urls: &[String],
+    refresh_type: &RefreshType,
+) -> BTreeMap<String, String> {
+    let mut params = BTreeMap::new();
+    params.insert("Action".to_string(), "RefreshObjectCaches".to_string());
+    params.insert("ObjectPath".to_string(), urls.join("\n"));
+    params.insert(
+        "ObjectType".to_string(),
+        refresh_type.as_api_value().to_string(),
+    );
+    params
 }
 
 fn parse_refresh_urls(urls: &str, refresh_type: &RefreshType) -> Result<Vec<String>> {
@@ -481,6 +502,43 @@ mod tests {
     #[test]
     fn rejects_empty_refresh_urls() {
         assert!(parse_refresh_urls(" , ", &RefreshType::File).is_err());
+    }
+
+    #[test]
+    fn parses_cdn_refresh_cli_with_ci_refresh_type_value() {
+        let cli = Cli::try_parse_from([
+            "aliyun-tools",
+            "cdn",
+            "refresh",
+            "--urls",
+            "https://example.com/app",
+            "--type",
+            "Directory",
+        ])
+        .unwrap();
+
+        let Commands::Cdn { command } = cli.command else {
+            panic!("expected cdn command");
+        };
+        let CdnCommand::Refresh { urls, refresh_type } = command;
+        assert_eq!(urls, "https://example.com/app");
+        assert_eq!(refresh_type, RefreshType::Directory);
+    }
+
+    #[test]
+    fn builds_cdn_refresh_request_params() {
+        let urls = vec![
+            "https://example.com/a/".to_string(),
+            "https://example.com/b/".to_string(),
+        ];
+        let params = refresh_object_caches_params(&urls, &RefreshType::Directory);
+
+        assert_eq!(params.get("Action").unwrap(), "RefreshObjectCaches");
+        assert_eq!(params.get("ObjectType").unwrap(), "directory");
+        assert_eq!(
+            params.get("ObjectPath").unwrap(),
+            "https://example.com/a/\nhttps://example.com/b/"
+        );
     }
 
     #[test]
