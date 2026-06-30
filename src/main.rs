@@ -102,8 +102,14 @@ enum EdgeScriptCommand {
         pos: EdgeScriptPosition,
         #[arg(long, value_enum, default_value = "on")]
         enable: OnOff,
+        #[arg(long, value_enum, default_value = "upsert")]
+        mode: EdgeScriptPushMode,
     },
     PublishStaging {
+        #[arg(long)]
+        domain: String,
+    },
+    SyncProductionToStaging {
         #[arg(long)]
         domain: String,
     },
@@ -172,6 +178,12 @@ impl EdgeScriptPosition {
 }
 
 #[derive(Clone, Debug, ValueEnum)]
+enum EdgeScriptPushMode {
+    Upsert,
+    Append,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
 enum OnOff {
     On,
     Off,
@@ -234,17 +246,33 @@ fn main() -> Result<()> {
                 pri,
                 pos,
                 enable,
+                mode,
             } => {
                 let client = cdn_client_from_env()?;
                 let rule = fs::read_to_string(&rule_file)
                     .with_context(|| format!("failed to read rule file {rule_file}"))?;
-                let response =
-                    client.push_edgescript_staging(&domain, &rule, &name, pri, &pos, &enable)?;
+                if pri > 999 {
+                    return Err(anyhow!("--pri must be between 0 and 999"));
+                }
+                let config_id = match mode {
+                    EdgeScriptPushMode::Upsert => {
+                        client.find_edgescript_config_id(&domain, &name)?
+                    }
+                    EdgeScriptPushMode::Append => None,
+                };
+                let functions =
+                    edgescript_staging_functions(&rule, &name, pri, &pos, &enable, config_id)?;
+                let response = client.set_edgescript_staging_config(&domain, functions)?;
                 print_json(&response)?;
             }
             EdgeScriptCommand::PublishStaging { domain } => {
                 let client = cdn_client_from_env()?;
                 let response = client.publish_edgescript_staging(&domain)?;
+                print_json(&response)?;
+            }
+            EdgeScriptCommand::SyncProductionToStaging { domain } => {
+                let client = cdn_client_from_env()?;
+                let response = client.sync_edgescript_production_to_staging(&domain)?;
                 print_json(&response)?;
             }
             EdgeScriptCommand::RollbackStaging { domain } => {
@@ -307,32 +335,7 @@ impl CdnClient {
         self.call(params)
     }
 
-    fn push_edgescript_staging(
-        &self,
-        domain: &str,
-        rule: &str,
-        name: &str,
-        pri: u16,
-        pos: &EdgeScriptPosition,
-        enable: &OnOff,
-    ) -> Result<Value> {
-        if pri > 999 {
-            return Err(anyhow!("--pri must be between 0 and 999"));
-        }
-
-        let functions = json!([
-            {
-                "functionName": "edge_function",
-                "functionArgs": [
-                    {"argName": "enable", "argValue": enable.as_api_value()},
-                    {"argName": "name", "argValue": name},
-                    {"argName": "pos", "argValue": pos.as_api_value()},
-                    {"argName": "pri", "argValue": pri.to_string()},
-                    {"argName": "rule", "argValue": rule}
-                ]
-            }
-        ]);
-
+    fn set_edgescript_staging_config(&self, domain: &str, functions: Value) -> Result<Value> {
         let mut params = BTreeMap::new();
         params.insert(
             "Action".to_string(),
@@ -342,6 +345,16 @@ impl CdnClient {
         params.insert("Functions".to_string(), functions.to_string());
 
         self.call(params)
+    }
+
+    fn find_edgescript_config_id(&self, domain: &str, name: &str) -> Result<Option<String>> {
+        let staging = self.query_edgescript(domain, &EdgeScriptEnv::Staging)?;
+        if let Some(config_id) = find_edgescript_config_id(&staging, name)? {
+            return Ok(Some(config_id));
+        }
+
+        let production = self.query_edgescript(domain, &EdgeScriptEnv::Production)?;
+        find_edgescript_config_id(&production, name)
     }
 
     fn publish_edgescript_staging(&self, domain: &str) -> Result<Value> {
@@ -359,6 +372,15 @@ impl CdnClient {
     fn rollback_edgescript_staging(&self, domain: &str) -> Result<Value> {
         let mut params = BTreeMap::new();
         params.insert("Action".to_string(), "RollbackStagingConfig".to_string());
+        params.insert("DomainName".to_string(), domain.to_string());
+        params.insert("FunctionName".to_string(), "edge_function".to_string());
+
+        self.call(params)
+    }
+
+    fn sync_edgescript_production_to_staging(&self, domain: &str) -> Result<Value> {
+        let mut params = BTreeMap::new();
+        params.insert("Action".to_string(), "CopyOnlineConfig".to_string());
         params.insert("DomainName".to_string(), domain.to_string());
         params.insert("FunctionName".to_string(), "edge_function".to_string());
 
@@ -417,6 +439,111 @@ fn parse_refresh_urls(urls: &str, refresh_type: &RefreshType) -> Result<Vec<Stri
     }
 
     Ok(parsed)
+}
+
+fn edgescript_staging_functions(
+    rule: &str,
+    name: &str,
+    pri: u16,
+    pos: &EdgeScriptPosition,
+    enable: &OnOff,
+    config_id: Option<String>,
+) -> Result<Value> {
+    let mut function = json!({
+        "functionId": 180,
+        "functionName": "edge_function",
+        "functionArgs": [
+            {"argName": "enable", "argValue": enable.as_api_value()},
+            {"argName": "name", "argValue": name},
+            {"argName": "pos", "argValue": pos.as_api_value()},
+            {"argName": "pri", "argValue": pri.to_string()},
+            {"argName": "rule", "argValue": rule}
+        ]
+    });
+
+    if let Some(config_id) = config_id {
+        function["configId"] = Value::Number(
+            config_id
+                .parse::<u64>()
+                .with_context(|| format!("ConfigId {config_id} is not numeric"))?
+                .into(),
+        );
+    }
+
+    Ok(Value::Array(vec![function]))
+}
+
+fn find_edgescript_config_id(response: &Value, name: &str) -> Result<Option<String>> {
+    let Some(functions) = response
+        .pointer("/DomainConfigs/DomainConfig")
+        .or_else(|| response.pointer("/DomainConfigList/DomainConfig"))
+        .or_else(|| response.pointer("/DomainConfigs"))
+        .or_else(|| response.pointer("/DomainConfigList"))
+    else {
+        return Ok(None);
+    };
+
+    for function in value_items(functions) {
+        let function_name = function
+            .get("FunctionName")
+            .or_else(|| function.get("functionName"))
+            .and_then(Value::as_str);
+        if function_name != Some("edge_function") {
+            continue;
+        }
+
+        if edgescript_arg_value(function, "name") == Some(name) {
+            let config_id = function
+                .get("ConfigId")
+                .or_else(|| function.get("configId"))
+                .and_then(value_to_string)
+                .ok_or_else(|| {
+                    anyhow!("edge_function {name} matched but did not include ConfigId")
+                })?;
+            return Ok(Some(config_id));
+        }
+    }
+
+    Ok(None)
+}
+
+fn value_items(value: &Value) -> Vec<&Value> {
+    match value {
+        Value::Array(items) => items.iter().collect(),
+        Value::Object(_) => vec![value],
+        _ => Vec::new(),
+    }
+}
+
+fn edgescript_arg_value<'a>(function: &'a Value, arg_name: &str) -> Option<&'a str> {
+    let args = function
+        .get("FunctionArgs")
+        .or_else(|| function.get("functionArgs"))?;
+    let args = args
+        .get("FunctionArg")
+        .or_else(|| args.get("functionArg"))
+        .unwrap_or(args);
+
+    for arg in value_items(args) {
+        if arg.get("ArgName").and_then(Value::as_str) == Some(arg_name)
+            || arg.get("argName").and_then(Value::as_str) == Some(arg_name)
+        {
+            return arg
+                .get("ArgValue")
+                .or_else(|| arg.get("argValue"))
+                .and_then(Value::as_str);
+        }
+    }
+
+    None
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn resolve_staging_addrs(staging_domain: &str) -> Result<Vec<SocketAddr>> {
@@ -683,21 +810,213 @@ mod tests {
 
     #[test]
     fn staging_push_shape_contains_edge_function_rule() {
-        let functions = json!([
-            {
-                "functionName": "edge_function",
-                "functionArgs": [
-                    {"argName": "enable", "argValue": "on"},
-                    {"argName": "name", "argValue": "static_site_rewrite"},
-                    {"argName": "pos", "argValue": "head"},
-                    {"argName": "pri", "argValue": "1"},
-                    {"argName": "rule", "argValue": "if eq($uri, '/') {}"}
-                ]
-            }
-        ]);
+        let functions = edgescript_staging_functions(
+            "if eq($uri, '/') {}",
+            "static_site_rewrite",
+            1,
+            &EdgeScriptPosition::Head,
+            &OnOff::On,
+            None,
+        )
+        .unwrap();
 
         assert!(functions.to_string().contains("edge_function"));
         assert!(functions.to_string().contains("static_site_rewrite"));
+        assert!(!functions.to_string().contains("configId"));
+        assert_eq!(functions[0]["functionId"], 180);
+    }
+
+    #[test]
+    fn staging_push_shape_contains_config_id_when_updating() {
+        let functions = edgescript_staging_functions(
+            "if eq($uri, '/') {}",
+            "static_site_rewrite",
+            1,
+            &EdgeScriptPosition::Head,
+            &OnOff::On,
+            Some("123456".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(functions[0]["configId"], 123456);
+    }
+
+    #[test]
+    fn builds_staging_config_function_payload() {
+        let functions = edgescript_staging_functions(
+            "if eq($uri, '/') {}",
+            "static_site_rewrite",
+            1,
+            &EdgeScriptPosition::Head,
+            &OnOff::On,
+            Some("123456".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(functions[0]["functionId"], 180);
+        assert_eq!(functions[0]["functionName"], "edge_function");
+        assert_eq!(functions[0]["configId"], 123456);
+        assert_eq!(functions[0]["functionArgs"][1]["argName"], "name");
+        assert_eq!(
+            functions[0]["functionArgs"][1]["argValue"],
+            "static_site_rewrite"
+        );
+    }
+
+    #[test]
+    fn finds_edgescript_config_id_by_name() {
+        let response = json!({
+            "DomainConfigs": {
+                "DomainConfig": [
+                    {
+                        "ConfigId": 111,
+                        "FunctionName": "edge_function",
+                        "FunctionArgs": {
+                            "FunctionArg": [
+                                {"ArgName": "name", "ArgValue": "other_rule"}
+                            ]
+                        }
+                    },
+                    {
+                        "ConfigId": "222",
+                        "FunctionName": "edge_function",
+                        "FunctionArgs": {
+                            "FunctionArg": [
+                                {"ArgName": "name", "ArgValue": "static_site_rewrite"}
+                            ]
+                        }
+                    }
+                ]
+            }
+        });
+
+        let config_id = find_edgescript_config_id(&response, "static_site_rewrite").unwrap();
+        assert_eq!(config_id.as_deref(), Some("222"));
+    }
+
+    #[test]
+    fn finds_edgescript_config_id_from_staging_shape() {
+        let response = json!({
+            "DomainConfigs": [
+                {
+                    "configId": "staging-config",
+                    "FunctionName": "edge_function",
+                    "functionArgs": [
+                        {"argName": "name", "argValue": "static_site_rewrite"}
+                    ]
+                }
+            ]
+        });
+
+        let config_id = find_edgescript_config_id(&response, "static_site_rewrite").unwrap();
+        assert_eq!(config_id.as_deref(), Some("staging-config"));
+    }
+
+    #[test]
+    fn finds_edgescript_config_id_from_lowercase_function_name() {
+        let response = json!({
+            "DomainConfigList": {
+                "DomainConfig": {
+                    "configId": "lowercase-config",
+                    "functionName": "edge_function",
+                    "functionArgs": [
+                        {"argName": "name", "argValue": "static_site_rewrite"}
+                    ]
+                }
+            }
+        });
+
+        let config_id = find_edgescript_config_id(&response, "static_site_rewrite").unwrap();
+        assert_eq!(config_id.as_deref(), Some("lowercase-config"));
+    }
+
+    #[test]
+    fn ignores_non_matching_edgescript_rules() {
+        let response = json!({
+            "DomainConfigs": {
+                "DomainConfig": {
+                    "ConfigId": 111,
+                    "FunctionName": "edge_function",
+                    "FunctionArgs": {
+                        "FunctionArg": [
+                            {"ArgName": "name", "ArgValue": "other_rule"}
+                        ]
+                    }
+                }
+            }
+        });
+
+        let config_id = find_edgescript_config_id(&response, "static_site_rewrite").unwrap();
+        assert_eq!(config_id, None);
+    }
+
+    #[test]
+    fn errors_when_matching_edgescript_rule_has_no_config_id() {
+        let response = json!({
+            "DomainConfigs": {
+                "DomainConfig": {
+                    "FunctionName": "edge_function",
+                    "FunctionArgs": {
+                        "FunctionArg": [
+                            {"ArgName": "name", "ArgValue": "static_site_rewrite"}
+                        ]
+                    }
+                }
+            }
+        });
+
+        let err = find_edgescript_config_id(&response, "static_site_rewrite").unwrap_err();
+        assert!(err.to_string().contains("did not include ConfigId"));
+    }
+
+    #[test]
+    fn parses_push_staging_default_upsert_mode() {
+        let cli = Cli::try_parse_from([
+            "aliyun-tools",
+            "edgescript",
+            "push-staging",
+            "--domain",
+            ".aiyou178.com",
+            "--rule-file",
+            "cdn/edgescript.generated.es",
+            "--name",
+            "static_site_rewrite",
+        ])
+        .unwrap();
+
+        let Commands::Edgescript { command } = cli.command else {
+            panic!("expected edgescript command");
+        };
+        let EdgeScriptCommand::PushStaging { mode, .. } = command else {
+            panic!("expected push-staging command");
+        };
+        assert!(matches!(mode, EdgeScriptPushMode::Upsert));
+    }
+
+    #[test]
+    fn parses_push_staging_append_mode() {
+        let cli = Cli::try_parse_from([
+            "aliyun-tools",
+            "edgescript",
+            "push-staging",
+            "--domain",
+            ".aiyou178.com",
+            "--rule-file",
+            "cdn/edgescript.generated.es",
+            "--name",
+            "static_site_rewrite",
+            "--mode",
+            "append",
+        ])
+        .unwrap();
+
+        let Commands::Edgescript { command } = cli.command else {
+            panic!("expected edgescript command");
+        };
+        let EdgeScriptCommand::PushStaging { mode, .. } = command else {
+            panic!("expected push-staging command");
+        };
+        assert!(matches!(mode, EdgeScriptPushMode::Append));
     }
 
     #[test]
@@ -718,6 +1037,26 @@ mod tests {
             panic!("expected test-staging command");
         };
         assert_eq!(url, "https://admin2.aiyou178.com/");
+    }
+
+    #[test]
+    fn parses_sync_production_to_staging_cli() {
+        let cli = Cli::try_parse_from([
+            "aliyun-tools",
+            "edgescript",
+            "sync-production-to-staging",
+            "--domain",
+            ".aiyou178.com",
+        ])
+        .unwrap();
+
+        let Commands::Edgescript { command } = cli.command else {
+            panic!("expected edgescript command");
+        };
+        let EdgeScriptCommand::SyncProductionToStaging { domain } = command else {
+            panic!("expected sync-production-to-staging command");
+        };
+        assert_eq!(domain, ".aiyou178.com");
     }
 
     #[test]
