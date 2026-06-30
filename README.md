@@ -23,12 +23,14 @@ aliyun-tools cdn refresh \
 
 ```bash
 aliyun-tools edgescript query --domain "$CDN_EDGE_DOMAIN" --env production
+aliyun-tools edgescript sync-production-to-staging --domain "$CDN_EDGE_DOMAIN"
 aliyun-tools edgescript push-staging \
   --domain "$CDN_EDGE_DOMAIN" \
   --rule-file cdn/edgescript.generated.es \
   --name static_site_rewrite \
   --pri 1 \
-  --pos head
+  --pos head \
+  --mode upsert
 aliyun-tools edgescript publish-staging --domain "$CDN_EDGE_DOMAIN"
 aliyun-tools edgescript rollback-staging --domain "$CDN_EDGE_DOMAIN"
 aliyun-tools edgescript test-staging --url "https://admin2.aiyou178.com/"
