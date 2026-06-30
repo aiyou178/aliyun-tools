@@ -375,7 +375,21 @@ impl CdnClient {
         params.insert("DomainName".to_string(), domain.to_string());
         params.insert("FunctionName".to_string(), "edge_function".to_string());
 
-        self.call(params)
+        let (status, response) = self.request(params)?;
+        if status == reqwest::StatusCode::NOT_FOUND
+            && response.get("Code").and_then(Value::as_str) == Some("StagingConfig.NotFound")
+        {
+            eprintln!("No staging config exists.");
+            return Ok(response);
+        }
+
+        if !status.is_success() {
+            return Err(anyhow!(
+                "Aliyun API request failed with {status}: {response}"
+            ));
+        }
+
+        Ok(response)
     }
 
     fn sync_edgescript_production_to_staging(&self, domain: &str) -> Result<Value> {
@@ -387,7 +401,7 @@ impl CdnClient {
         self.call(params)
     }
 
-    fn call(&self, params: BTreeMap<String, String>) -> Result<Value> {
+    fn request(&self, params: BTreeMap<String, String>) -> Result<(reqwest::StatusCode, Value)> {
         let signed_params = sign_params(params, &self.credentials)?;
         let response = self.http.get(CDN_ENDPOINT).query(&signed_params).send()?;
         let status = response.status();
@@ -396,6 +410,11 @@ impl CdnClient {
         let parsed = serde_json::from_str::<Value>(&body)
             .with_context(|| format!("Aliyun response was not JSON: {body}"))?;
 
+        Ok((status, parsed))
+    }
+
+    fn call(&self, params: BTreeMap<String, String>) -> Result<Value> {
+        let (status, parsed) = self.request(params)?;
         if !status.is_success() {
             return Err(anyhow!("Aliyun API request failed with {status}: {parsed}"));
         }
