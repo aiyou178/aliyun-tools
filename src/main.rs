@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::blocking::{Client, ClientBuilder};
-use reqwest::Url;
+use reqwest::{Method, Url};
 use serde_json::{json, Value};
 use sha1::Sha1;
 use uuid::Uuid;
@@ -23,6 +23,7 @@ const ACCESS_KEY_SECRET_ENV: &str = "ALIBABA_CLOUD_ACCESS_KEY_SECRET";
 
 const ALIYUN_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
+    .add(b'!')
     .add(b'"')
     .add(b'#')
     .add(b'$')
@@ -73,11 +74,35 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum CdnCommand {
+    /// Query or update a CDN domain's HTTPS certificate.
+    Cert {
+        #[command(subcommand)]
+        command: CertificateCommand,
+    },
     Refresh {
         #[arg(long)]
         urls: String,
         #[arg(long = "type", default_value = "File")]
         refresh_type: RefreshType,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CertificateCommand {
+    Query {
+        #[arg(long)]
+        domain: String,
+    },
+    /// Upload a PEM certificate chain and private key, enabling HTTPS.
+    Update {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        cert_file: String,
+        #[arg(long)]
+        key_file: String,
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -223,6 +248,38 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Cdn { command } => match command {
+            CdnCommand::Cert { command } => {
+                let response = match command {
+                    CertificateCommand::Query { domain } => cdn_client_from_env()?.call(
+                        Method::GET,
+                        BTreeMap::from([
+                            (
+                                "Action".to_string(),
+                                "DescribeDomainCertificateInfo".to_string(),
+                            ),
+                            ("DomainName".to_string(), domain),
+                        ]),
+                    )?,
+                    CertificateCommand::Update {
+                        domain,
+                        cert_file,
+                        key_file,
+                        name,
+                    } => {
+                        let certificate = fs::read_to_string(&cert_file).with_context(|| {
+                            format!("failed to read certificate file {cert_file}")
+                        })?;
+                        let private_key = fs::read_to_string(&key_file).with_context(|| {
+                            format!("failed to read private key file {key_file}")
+                        })?;
+                        cdn_client_from_env()?.call(
+                            Method::POST,
+                            certificate_update_params(&domain, certificate, private_key, name),
+                        )?
+                    }
+                };
+                print_json(&response)?;
+            }
             CdnCommand::Refresh { urls, refresh_type } => {
                 let client = cdn_client_from_env()?;
                 let urls = parse_refresh_urls(&urls, &refresh_type)?;
@@ -316,7 +373,10 @@ impl CdnClient {
     }
 
     fn refresh_object_caches(&self, urls: &[String], refresh_type: &RefreshType) -> Result<Value> {
-        self.call(refresh_object_caches_params(urls, refresh_type))
+        self.call(
+            Method::GET,
+            refresh_object_caches_params(urls, refresh_type),
+        )
     }
 
     fn query_edgescript(&self, domain: &str, environment: &EdgeScriptEnv) -> Result<Value> {
@@ -332,7 +392,7 @@ impl CdnClient {
         params.insert("DomainName".to_string(), domain.to_string());
         params.insert("FunctionNames".to_string(), "edge_function".to_string());
 
-        self.call(params)
+        self.call(Method::GET, params)
     }
 
     fn set_edgescript_staging_config(&self, domain: &str, functions: Value) -> Result<Value> {
@@ -344,7 +404,7 @@ impl CdnClient {
         params.insert("DomainName".to_string(), domain.to_string());
         params.insert("Functions".to_string(), functions.to_string());
 
-        self.call(params)
+        self.call(Method::GET, params)
     }
 
     fn find_edgescript_config_id(&self, domain: &str, name: &str) -> Result<Option<String>> {
@@ -366,7 +426,7 @@ impl CdnClient {
         params.insert("DomainName".to_string(), domain.to_string());
         params.insert("FunctionName".to_string(), "edge_function".to_string());
 
-        self.call(params)
+        self.call(Method::GET, params)
     }
 
     fn rollback_edgescript_staging(&self, domain: &str) -> Result<Value> {
@@ -375,7 +435,7 @@ impl CdnClient {
         params.insert("DomainName".to_string(), domain.to_string());
         params.insert("FunctionName".to_string(), "edge_function".to_string());
 
-        let (status, response) = self.request(params)?;
+        let (status, response) = self.request(Method::GET, params)?;
         if status == reqwest::StatusCode::NOT_FOUND
             && response.get("Code").and_then(Value::as_str) == Some("StagingConfig.NotFound")
         {
@@ -398,12 +458,31 @@ impl CdnClient {
         params.insert("DomainName".to_string(), domain.to_string());
         params.insert("FunctionName".to_string(), "edge_function".to_string());
 
-        self.call(params)
+        self.call(Method::GET, params)
     }
 
-    fn request(&self, params: BTreeMap<String, String>) -> Result<(reqwest::StatusCode, Value)> {
-        let signed_params = sign_params(params, &self.credentials)?;
-        let response = self.http.get(CDN_ENDPOINT).query(&signed_params).send()?;
+    fn build_request(
+        &self,
+        method: Method,
+        params: BTreeMap<String, String>,
+    ) -> Result<reqwest::blocking::Request> {
+        let signed_params = sign_params(params, &self.credentials, &method)?;
+        let request = self.http.request(method.clone(), CDN_ENDPOINT);
+        let request = if method == Method::GET {
+            request.query(&signed_params)
+        } else {
+            request.form(&signed_params)
+        };
+        Ok(request.build()?)
+    }
+
+    fn request(
+        &self,
+        method: Method,
+        params: BTreeMap<String, String>,
+    ) -> Result<(reqwest::StatusCode, Value)> {
+        let request = self.build_request(method, params)?;
+        let response = self.http.execute(request)?;
         let status = response.status();
         let body = response.text()?;
 
@@ -413,14 +492,37 @@ impl CdnClient {
         Ok((status, parsed))
     }
 
-    fn call(&self, params: BTreeMap<String, String>) -> Result<Value> {
-        let (status, parsed) = self.request(params)?;
+    fn call(&self, method: Method, params: BTreeMap<String, String>) -> Result<Value> {
+        let (status, parsed) = self.request(method, params)?;
         if !status.is_success() {
             return Err(anyhow!("Aliyun API request failed with {status}: {parsed}"));
         }
 
         Ok(parsed)
     }
+}
+
+fn certificate_update_params(
+    domain: &str,
+    certificate: String,
+    private_key: String,
+    name: Option<String>,
+) -> BTreeMap<String, String> {
+    let mut params = BTreeMap::from([
+        (
+            "Action".to_string(),
+            "SetCdnDomainSSLCertificate".to_string(),
+        ),
+        ("DomainName".to_string(), domain.to_string()),
+        ("CertType".to_string(), "upload".to_string()),
+        ("SSLProtocol".to_string(), "on".to_string()),
+        ("SSLPub".to_string(), certificate),
+        ("SSLPri".to_string(), private_key),
+    ]);
+    if let Some(name) = name {
+        params.insert("CertName".to_string(), name);
+    }
+    params
 }
 
 fn refresh_object_caches_params(
@@ -643,6 +745,7 @@ fn staging_test_client(host: &str, addr: SocketAddr, timeout: Duration) -> Clien
 fn sign_params(
     mut params: BTreeMap<String, String>,
     credentials: &Credentials,
+    method: &Method,
 ) -> Result<BTreeMap<String, String>> {
     params.insert("Format".to_string(), "JSON".to_string());
     params.insert("Version".to_string(), API_VERSION.to_string());
@@ -656,7 +759,10 @@ fn sign_params(
     );
 
     let canonicalized_query = canonicalized_query(&params);
-    let string_to_sign = format!("GET&%2F&{}", aliyun_percent_encode(&canonicalized_query));
+    let string_to_sign = format!(
+        "{method}&%2F&{}",
+        aliyun_percent_encode(&canonicalized_query)
+    );
     let signature = signature(&string_to_sign, &credentials.access_key_secret)?;
     params.insert("Signature".to_string(), signature);
 
@@ -769,7 +875,9 @@ mod tests {
         let Commands::Cdn { command } = cli.command else {
             panic!("expected cdn command");
         };
-        let CdnCommand::Refresh { urls, refresh_type } = command;
+        let CdnCommand::Refresh { urls, refresh_type } = command else {
+            panic!("expected refresh command");
+        };
         assert_eq!(urls, "https://example.com/app");
         assert_eq!(refresh_type, RefreshType::Directory);
     }
@@ -792,7 +900,7 @@ mod tests {
 
     #[test]
     fn percent_encoding_matches_aliyun_requirements() {
-        assert_eq!(aliyun_percent_encode("a b*c~"), "a%20b%2Ac~");
+        assert_eq!(aliyun_percent_encode("a b*c~!"), "a%20b%2Ac~%21");
         assert_eq!(aliyun_percent_encode("/?:&="), "%2F%3F%3A%26%3D");
     }
 
@@ -825,6 +933,141 @@ mod tests {
     fn signs_known_string() {
         let value = signature("GET&%2F&Action%3DTest", "secret").unwrap();
         assert_eq!(value, "vqA/LwIo/qiGVRH8r7L/RtWdrNM=");
+        assert_eq!(
+            signature("POST&%2F&Action%3DTest", "secret").unwrap(),
+            "IRD2nMyxYMLPfAcYXB1u8Mhupbo="
+        );
+    }
+
+    #[test]
+    fn parses_certificate_commands_and_requires_both_files_for_update() {
+        let query = Cli::try_parse_from([
+            "aliyun-tools",
+            "cdn",
+            "cert",
+            "query",
+            "--domain",
+            "example.com",
+        ])
+        .unwrap();
+        assert!(matches!(query.command, Commands::Cdn {
+            command: CdnCommand::Cert { command: CertificateCommand::Query { domain } }
+        } if domain == "example.com"));
+
+        let args = [
+            "aliyun-tools",
+            "cdn",
+            "cert",
+            "update",
+            "--domain",
+            ".example.com",
+            "--cert-file",
+            "chain.pem",
+            "--key-file",
+            "private.key",
+        ];
+        let update = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(update.command, Commands::Cdn {
+            command: CdnCommand::Cert {
+                command: CertificateCommand::Update { domain, cert_file, key_file, name: None }
+            }
+        } if domain == ".example.com" && cert_file == "chain.pem" && key_file == "private.key"));
+        assert!(Cli::try_parse_from(&args[..8]).is_err());
+        assert!(Cli::try_parse_from([
+            "aliyun-tools",
+            "cdn",
+            "cert",
+            "update",
+            "--domain",
+            "example.com",
+            "--key-file",
+            "private.key",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn certificate_update_posts_complete_pem_and_signs_the_post_body() {
+        let client = CdnClient::new(Credentials {
+            access_key_id: "test-id".to_string(),
+            access_key_secret: "secret".to_string(),
+        });
+        let certificate =
+            "-----BEGIN CERTIFICATE-----\nA+B/C==\n-----END CERTIFICATE-----\n".repeat(3);
+        let private_key = "-----BEGIN PRIVATE KEY-----\nD+E/F==\n-----END PRIVATE KEY-----\n";
+        let request = client
+            .build_request(
+                Method::POST,
+                certificate_update_params(
+                    ".example.com",
+                    certificate.clone(),
+                    private_key.to_string(),
+                    Some("renewal!2026".to_string()),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.url().as_str(), CDN_ENDPOINT);
+        assert_eq!(
+            request.headers()["content-type"],
+            "application/x-www-form-urlencoded"
+        );
+        let mut params: BTreeMap<String, String> = reqwest::Url::parse(&format!(
+            "https://example.com/?{}",
+            std::str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap()
+        ))
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect();
+        assert_eq!(params["Action"], "SetCdnDomainSSLCertificate");
+        assert_eq!(params["DomainName"], ".example.com");
+        assert_eq!(params["SSLProtocol"], "on");
+        assert_eq!(params["CertType"], "upload");
+        assert_eq!(params["CertName"], "renewal!2026");
+        assert_eq!(params["SSLPub"], certificate);
+        assert_eq!(params["SSLPri"], private_key);
+        let actual_signature = params.remove("Signature").unwrap();
+        let canonical = aliyun_percent_encode(&canonicalized_query(&params));
+        assert!(canonical.contains("CertName%3Drenewal%25212026"));
+        assert_eq!(
+            actual_signature,
+            signature(&format!("POST&%2F&{canonical}"), "secret").unwrap()
+        );
+        assert_ne!(
+            actual_signature,
+            signature(&format!("GET&%2F&{canonical}"), "secret").unwrap()
+        );
+    }
+
+    #[test]
+    fn existing_get_requests_keep_query_parameters_and_get_signature() {
+        let client = CdnClient::new(Credentials {
+            access_key_id: "test-id".to_string(),
+            access_key_secret: "secret".to_string(),
+        });
+        let request = client
+            .build_request(
+                Method::GET,
+                refresh_object_caches_params(
+                    &["https://example.com/".to_string()],
+                    &RefreshType::Directory,
+                ),
+            )
+            .unwrap();
+        assert_eq!(request.method(), Method::GET);
+        assert!(request.body().is_none());
+        let mut params: BTreeMap<String, String> =
+            request.url().query_pairs().into_owned().collect();
+        assert_eq!(params["Action"], "RefreshObjectCaches");
+        assert_eq!(params["ObjectPath"], "https://example.com/");
+        let actual_signature = params.remove("Signature").unwrap();
+        let canonical = aliyun_percent_encode(&canonicalized_query(&params));
+        assert_eq!(
+            actual_signature,
+            signature(&format!("GET&%2F&{canonical}"), "secret").unwrap()
+        );
     }
 
     #[test]
